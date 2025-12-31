@@ -1,0 +1,325 @@
+name: Jules Apply Changes - Enhanced Autonomy
+
+on:
+  workflow_run:
+    workflows: ["Minimax Review", "Minimax Review - Enhanced"]
+    types: [completed]
+
+# Prevent concurrent runs on same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  apply-changes-autonomous:
+    name: Autonomous Jules Application
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Only run if the source workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      apply_status: ${{ steps.apply.outputs.apply_status }}
+      changes_detected: ${{ steps.apply.outputs.changes_detected }}
+      auto_apply_count: ${{ steps.apply.outputs.auto_apply_count }}
+      manual_review_count: ${{ steps.apply.outputs.manual_review_count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download review artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: minimax-review
+          path: review-artifacts/
+        continue-on-error: true
+
+      - name: Validate and parse review artifacts
+        id: validate-artifacts
+        run: |
+          echo "🔍 Validating review artifacts..."
+          
+          # Check if artifacts exist
+          if [[ -d "review-artifacts" ]]; then
+            ARTIFACT_COUNT=$(ls -la review-artifacts/ 2>/dev/null | wc -l)
+            echo "artifacts_found=$ARTIFACT_COUNT" >> $GITHUB_OUTPUT
+            echo "✅ Found $ARTIFACT_COUNT artifacts"
+          else
+            echo "⚠️  No artifacts directory found"
+            echo "artifacts_found=0" >> $GITHUB_OUTPUT
+          fi
+          
+          # Look for review files with multiple naming patterns
+          REVIEW_FILE=""
+          for filename in "minimax_review.md" "review.md" "analysis.md" "report.md"; do
+            if [[ -f "review-artifacts/$filename" ]]; then
+              REVIEW_FILE="review-artifacts/$filename"
+              echo "📄 Found review file: $filename"
+              break
+            fi
+          done
+          
+          if [[ -z "$REVIEW_FILE" ]]; then
+            # Search recursively
+            REVIEW_FILE=$(find review-artifacts -name "*.md" -type f 2>/dev/null | head -1)
+          fi
+          
+          if [[ -n "$REVIEW_FILE" && -f "$REVIEW_FILE" ]]; then
+            echo "review_file=$REVIEW_FILE" >> $GITHUB_OUTPUT
+            echo "✅ Review file validated"
+          else
+            echo "❌ No valid review file found"
+            echo "review_file=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Parse and categorize changes from review
+        id: parse-changes
+        run: |
+          echo "📋 Parsing review for actionable changes..."
+          
+          CHANGES_FILE="${{ steps.validate-artifacts.outputs.review_file }}"
+          
+          if [[ -z "$CHANGES_FILE" || ! -f "$CHANGES_FILE" ]]; then
+            echo "⚠️  No changes to apply - review file not available"
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo "auto_apply_count=0" >> $GITHUB_OUTPUT
+            echo "manual_review_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Extract different types of changes
+          mkdir -p apply-scripts
+          
+          # Parse diffs from markdown
+          awk '
+            /^[#]+ (Proposed Changes|Diffs|Fixes|Updates)/ { 
+              in_section=1; next 
+            }
+            /^[#]+ / && !/^[#]+ (Proposed Changes|Diffs|Fixes|Updates)/ { 
+              in_section=0 
+            }
+            in_section && /````*(diff|patch|diffs)?/` {
+              in_diff=1;
+              diff_content="";
+              next
+            }
+            in_diff && /````*/ {
+              in_diff=0;
+              if (diff_content != "") {
+                print diff_content > "apply-scripts/diff_" NR ".patch"
+              }
+              next
+            }
+            in_diff {
+              diff_content = diff_content $0 "\n"
+            }
+          ' "$CHANGES_FILE" 2>/dev/null || true
+          
+          # Count and categorize
+          AUTO_APPLY_COUNT=0
+          MANUAL_REVIEW_COUNT=0
+          CHANGE_TYPES=""
+          
+          for patch in apply-scripts/diff_*.patch; do
+            if [[ -f "$patch" && -s "$patch" ]]; then
+              # Determine if auto-applyable (simple, non-destructive)
+              if grep -q "^---" "$patch" && grep -q "^@@" "$patch"; then
+                # Looks like a valid diff
+                if ! grep -qi "breaking\|migration\|database\|schema" "$patch" 2>/dev/null; then
+                  AUTO_APPLY_COUNT=$((AUTO_APPLY_COUNT + 1))
+                  echo "✅ Auto-applicable: $(basename $patch)"
+                else
+                  MANUAL_REVIEW_COUNT=$((MANUAL_REVIEW_COUNT + 1))
+                  echo "⚠️  Manual review needed: $(basename $patch)"
+                fi
+              else
+                MANUAL_REVIEW_COUNT=$((MANUAL_REVIEW_COUNT + 1))
+              fi
+            fi
+          done
+          
+          TOTAL_CHANGES=$((AUTO_APPLY_COUNT + MANUAL_REVIEW_COUNT))
+          
+          echo "changes_detected=true" >> $GITHUB_OUTPUT
+          echo "auto_apply_count=$AUTO_APPLY_COUNT" >> $GITHUB_OUTPUT
+          echo "manual_review_count=$MANUAL_REVIEW_COUNT" >> $GITHUB_OUTPUT
+          echo "total_changes=$TOTAL_CHANGES" >> $GITHUB_OUTPUT
+          
+          if [[ $TOTAL_CHANGES -gt 0 ]]; then
+            echo "✅ Parsed $TOTAL_CHANGES changes ($AUTO_APPLY_COUNT auto, $MANUAL_REVIEW_COUNT manual)"
+          else
+            echo "ℹ️  No diff-based changes detected in review"
+          fi
+
+      - name: Autonomous change application with safety checks
+        id: apply
+        env:
+          APPLY_STATUS="pending"
+        run: |
+          echo "🔧 Starting autonomous change application..."
+          
+          AUTO_APPLY_COUNT=${{ steps.parse-changes.outputs.auto_apply_count }}
+          MANUAL_REVIEW_COUNT=${{ steps.parse-changes.outputs.manual_review_count }}
+          CHANGES_DETECTED=${{ steps.parse-changes.outputs.changes_detected }}
+          
+          APPLIED_COUNT=0
+          FAILED_COUNT=0
+          SKIPPED_COUNT=0
+          
+          # Function to safely apply a patch
+          apply_patch() {
+            local patch_file=$1
+            local patch_name=$(basename "$patch_file")
+            
+            echo "📦 Applying: $patch_name"
+            
+            # Safety check: backup current state
+            git add -A
+            git stash push -m "backup-before-$patch_name" 2>/dev/null || true
+            
+            # Try to apply patch
+            if git apply "$patch_file" 2>/dev/null; then
+              echo "✅ Successfully applied: $patch_name"
+              return 0
+            else
+              # Try with whitespace tolerance
+              if git apply --whitespace=nowarn "$patch_file" 2>/dev/null; then
+                echo "✅ Applied with whitespace tolerance: $patch_name"
+                return 0
+              else
+                echo "❌ Failed to apply: $patch_name"
+                git stash pop 2>/dev/null || true
+                return 1
+              fi
+            fi
+          }
+          
+          # Auto-apply safe changes
+          if [[ "$CHANGES_DETECTED" == "true" && $AUTO_APPLY_COUNT -gt 0 ]]; then
+            echo "🚀 Applying $AUTO_APPLY_COUNT auto-applicable changes..."
+            
+            for patch in apply-scripts/diff_*.patch; do
+              if [[ -f "$patch" && -s "$patch" ]]; then
+                if apply_patch "$patch"; then
+                  APPLIED_COUNT=$((APPLIED_COUNT + 1))
+                else
+                  FAILED_COUNT=$((FAILED_COUNT + 1))
+                fi
+              fi
+            done
+            
+            # Commit applied changes
+            if [[ $APPLIED_COUNT -gt 0 ]]; then
+              echo "💾 Committing applied changes..."
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git config user.name "GitHub Actions Bot"
+              git add -A
+              git commit -m "🤖 Auto-apply Jules recommendations
+
+              Applied $APPLIED_COUNT change(s) from automated review.
+              Changes generated by Minimax Review workflow.
+              
+              Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>" 2>/dev/null && echo "✅ Changes committed" || echo "⚠️  Nothing to commit"
+            fi
+          else
+            echo "ℹ️  No auto-applicable changes found"
+            SKIPPED_COUNT=$AUTO_APPLY_COUNT
+          fi
+          
+          # Report results
+          if [[ $FAILED_COUNT -eq 0 && $APPLIED_COUNT -gt 0 ]]; then
+            APPLY_STATUS="success"
+          elif [[ $APPLIED_COUNT -gt 0 && $FAILED_COUNT -gt 0 ]]; then
+            APPLY_STATUS="partial"
+          elif [[ $FAILED_COUNT -gt 0 ]]; then
+            APPLY_STATUS="failed"
+          else
+            APPLY_STATUS="no_changes"
+          fi
+          
+          echo "apply_status=$APPLY_STATUS" >> $GITHUB_OUTPUT
+          echo "applied_count=$APPLIED_COUNT" >> $GITHUB_OUTPUT
+          echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "📊 Application Summary: $APPLIED_COUNT applied, $FAILED_COUNT failed, $SKIPPED_COUNT skipped"
+
+      - name: Generate application report
+        if: always()
+        run: |
+          # Create comprehensive application report
+          cat > application_report.md << EOF
+# 🤖 Autonomous Jules Application Report
+**Timestamp:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+**Workflow Run:** ${{ github.run_id }}
+
+## Application Summary
+- **Status:** ${{ steps.apply.outputs.apply_status }}
+- **Changes Detected:** ${{ steps.parse-changes.outputs.changes_detected }}
+- **Auto-applicable:** ${{ steps.parse-changes.outputs.auto_apply_count }}
+- **Manual Review:** ${{ steps.parse-changes.outputs.manual_review_count }}
+
+## Execution Results
+- **Applied:** ${{ steps.apply.outputs.applied_count }}
+- **Failed:** ${{ steps.apply.outputs.failed_count }}
+- **Skipped:** ${{ steps.apply.outputs.skipped_count }}
+
+## Next Steps
+EOF
+          
+          if [[ ${{ steps.apply.outputs.apply_status }} == "success" ]]; then
+            echo "✅ All applicable changes have been applied automatically" >> application_report.md
+            echo "- Changes committed to branch" >> application_report.md
+            echo "- Ready for review and merge" >> application_report.md
+          elif [[ ${{ steps.apply.outputs.apply_status }} == "partial" ]]; then
+            echo "⚠️  Some changes were applied, others require attention" >> application_report.md
+            echo "- Review failed applications in workflow logs" >> application_report.md
+            echo "- Manual review may be required for failed patches" >> application_report.md
+          else
+            echo "ℹ️  No automatic changes were applied" >> application_report.md
+            echo "- Review the Minimax Review output manually" >> application_report.md
+            echo "- Apply changes manually if needed" >> application_report.md
+          fi
+          
+          # Upload artifacts
+          echo "📤 Uploading application report..."
+
+      - name: Create pull request for applied changes
+        if: steps.apply.outputs.apply_status == 'success' || steps.apply.outputs.apply_status == 'partial'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            const applyStatus = '${{ steps.apply.outputs.apply_status }}';
+            const appliedCount = '${{ steps.apply.outputs.applied_count }}';
+            const failedCount = '${{ steps.apply.outputs.failed_count }}';
+            
+            let title = '🤖 Jules Recommendations Applied';
+            let body = `## Applied Changes Summary\n\n` +
+              `**Status:** ${applyStatus}\n` +
+              `**Applied:** ${appliedCount} change(s)\n` +
+              `**Failed:** ${failedCount}\n\n` +
+              `This pull request was automatically generated by the Jules Apply Changes workflow.\n\n` +
+              `### Changes Applied\n` +
+              `Automated recommendations from Minimax Review have been applied to this branch.\n\n` +
+              `---\n` +
+              `*🤖 Generated by GitHub Actions - Jules Autonomous Application*`;
+            
+            // Create PR
+            github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              head: context.ref,
+              base: 'main'
+            }).then(pr => {
+              console.log('✅ PR created:', pr.data.html_url);
+            }).catch(err => {
+              console.log('⚠️  PR creation skipped (may already exist):', err.message);
+            });

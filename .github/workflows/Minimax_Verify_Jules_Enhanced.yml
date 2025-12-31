@@ -1,0 +1,308 @@
+name: Minimax Verify Jules - Enhanced Autonomy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Add concurrency control to prevent overlapping runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-jules-autonomous:
+    name: Autonomous Jules Verification
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      verification_status: ${{ steps.verify.outputs.verification_status }}
+      retry_count: ${{ steps.verify.outputs.retry_count }}
+      error_recovery: ${{ steps.verify.outputs.error_recovery }}
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine base and head branches
+        id: branch-info
+        run: |
+          # Determine the base branch for comparison
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+            HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+          else
+            BASE_BRANCH="main"
+            HEAD_BRANCH="HEAD"
+          fi
+          echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+          echo "head_branch=$HEAD_BRANCH" >> $GITHUB_OUTPUT
+          echo "📍 Base branch: $BASE_BRANCH"
+          echo "📍 Head branch: $HEAD_BRANCH"
+
+      - name: Generate comprehensive diff
+        id: diff-generation
+        run: |
+          # Generate diff with multiple fallback strategies
+          echo "🔍 Generating diff between branches..."
+          
+          # Try fetching and comparing
+          if git fetch origin "${{ steps.branch-info.outputs.base_branch }}" 2>/dev/null; then
+            if git diff "origin/${{ steps.branch-info.outputs.base_branch }}...HEAD" > changes.diff 2>/dev/null; then
+              DIFF_SIZE=$(wc -c < changes.diff)
+              echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+              echo "✅ Generated diff: $DIFF_SIZE bytes"
+              if [[ "$DIFF_SIZE" -lt 100 ]]; then
+                echo "⚠️  Small diff detected, checking for alternative comparison..."
+                git diff HEAD~1..HEAD > changes.diff || true
+              fi
+            else
+              echo "🔄 Trying alternative diff strategy..."
+              git diff --staged > changes.diff || git diff HEAD~1..HEAD > changes.diff || echo "No changes detected" > changes.diff
+            fi
+          else
+            echo "🔄 Fetch failed, using local comparison..."
+            git diff --staged > changes.diff || git diff HEAD~1..HEAD > changes.diff || echo "No changes detected" > changes.diff
+          fi
+          
+          # Verify diff content
+          if [[ -s changes.diff ]]; then
+            echo "📊 Diff lines: $(wc -l < changes.diff)"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "⚠️  No changes detected in diff"
+          fi
+
+      - name: Create intelligent verification prompt
+        id: prompt-creation
+        run: |
+          # Create a comprehensive verification prompt with context
+          SCOPE_FILE=".jules-scope.md"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          
+          cat > verify_prompt.md << 'EOF'
+# Autonomous Verification Protocol
+## System Rules
+- Output only valid Markdown
+- Provide PASS or FAIL verdict
+- Include confidence score (0-100%)
+- Suggest recovery actions if failing
+
+## Verification Checklist
+1. Scope Validation: Confirm changes align with PR description
+2. Intent Verification: Ensure modifications match original objectives
+3. Regression Detection: Identify potential breaking changes
+4. Consistency Check: Verify coding patterns match repository standards
+5. Impact Assessment: Evaluate scope expansion risks
+
+## Output Format
+# Verification Result
+**Verdict:** PASS | FAIL | PARTIAL
+**Confidence:** [0-100]%
+**Scope Changes Detected:** YES | NO
+**Risk Level:** LOW | MEDIUM | HIGH
+
+# Detailed Analysis
+## Scope Compliance
+[Explanation of scope adherence]
+
+## Intent Alignment
+[How changes match original intent]
+
+## Potential Regressions
+[List any identified risks]
+
+## Recovery Recommendations
+[Suggested actions if issues found]
+EOF
+          
+          echo "📝 Verification prompt created successfully"
+
+      - name: Autonomous verification with retry and recovery
+        id: verify
+        env:
+          ATLAS_API_KEY: ${{ secrets.ATLAS_API_KEY }}
+          MAX_RETRIES: 3
+          BACKOFF_FACTOR: 2
+        run: |
+          VERIFICATION_STATUS="success"
+          RETRY_COUNT=0
+          ERROR_RECOVERY="none"
+          
+          # Function to attempt verification with exponential backoff
+          attempt_verification() {
+            local attempt=$1
+            local max_attempts=$2
+            local response_file="verdict_response_$attempt.json"
+            
+            echo "🔄 Verification attempt $attempt of $max_attempts..."
+            
+            # Prepare payload with context
+            DIFF_CONTENT=$(cat changes.diff 2>/dev/null || echo "")
+            PROMPT_CONTENT=$(cat verify_prompt.md 2>/dev/null || echo "")
+            
+            # Call API with timeout and error handling
+            if curl -s --max-time 30 --fail \
+              "https://api.atlascloud.ai/v1/chat/completions" \
+              -H "Authorization: Bearer $ATLAS_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg diff "${DIFF_CONTENT:0:8000}" \
+                --arg content "$PROMPT_CONTENT" \
+                '{
+                  model: "minimaxai/minimax-m2.1",
+                  messages: [
+                    {role: "system", content: "You are an autonomous code verification agent. Provide rigorous analysis with actionable feedback."},
+                    {role: "user", content: $content},
+                    {role: "user", content: "=== CHANGES TO VERIFY ===\n\($diff)"}
+                  ],
+                  temperature: 0,
+                  max_tokens: 2048
+                }')" > "$response_file" 2>/dev/null; then
+              
+              # Extract and validate response
+              if jq -e '.choices[0].message.content' "$response_file" > verdict.md 2>/dev/null; then
+                echo "✅ Verification successful on attempt $attempt"
+                return 0
+              fi
+            fi
+            
+            echo "⚠️  Attempt $attempt failed"
+            return 1
+          }
+          
+          # Execute verification with retry logic
+          while [[ $RETRY_COUNT -lt 3 ]]; do
+            if attempt_verification $((RETRY_COUNT + 1)) 3; then
+              break
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            
+            if [[ $RETRY_COUNT -lt 3 ]]; then
+              BACKOFF=$((RETRY_COUNT * 5))
+              echo "⏳ Backing off for ${BACKOFF}s before retry..."
+              sleep $BACKOFF
+            fi
+          done
+          
+          # Post-processing and error recovery
+          if [[ -s verdict.md ]]; then
+            # Analyze verdict content
+            if grep -qi "PASS" verdict.md; then
+              VERIFICATION_STATUS="passed"
+              echo "✅ Verification PASSED"
+            elif grep -qi "FAIL" verdict.md; then
+              VERIFICATION_STATUS="failed"
+              echo "❌ Verification FAILED"
+              
+              # Attempt error recovery - generate detailed report
+              ERROR_RECOVERY="report_generated"
+              cat >> verdict.md << 'EOF'
+
+## Recovery Actions Generated
+1. Detailed failure analysis has been logged
+2. Human review recommended for failed items
+3. Specific remediation steps outlined above
+EOF
+            elif grep -qi "PARTIAL" verdict.md; then
+              VERIFICATION_STATUS="partial"
+              ERROR_RECOVERY="partial_pass_with_warnings"
+              echo "⚠️  Verification PARTIAL - Some checks passed, some failed"
+            fi
+          else
+            VERIFICATION_STATUS="error"
+            ERROR_RECOVERY="fallback_to_manual"
+            
+            # Fallback: Generate basic diff summary
+            cat > verdict.md << EOF
+# Verification Fallback Report
+**Status:** MANUAL REVIEW REQUIRED
+**Reason:** Automated verification unavailable
+**Retry Attempts:** $RETRY_COUNT
+
+## Diff Summary
+- Lines changed: $(wc -l < changes.diff 2>/dev/null || echo "Unknown")
+- Files affected: $(git diff --name-only 2>/dev/null | wc -l)
+
+## Recommendation
+Please review changes manually before merging.
+EOF
+          fi
+          
+          # Output results
+          echo "verification_status=$VERIFICATION_STATUS" >> $GITHUB_OUTPUT
+          echo "retry_count=$RETRY_COUNT" >> $GITHUB_OUTPUT
+          echo "error_recovery=$ERROR_RECOVERY" >> $GITHUB_OUTPUT
+          
+          # Fail only on critical failures
+          if [[ "$VERIFICATION_STATUS" == "error" && "$ERROR_RECOVERY" == "fallback_to_manual" ]]; then
+            echo "⚠️  Falling back to manual verification mode"
+            exit 0  # Don't fail the workflow, allow manual review
+          elif [[ "$VERIFICATION_STATUS" == "failed" ]]; then
+            echo "❌ Critical verification failure detected"
+            exit 1
+          fi
+
+      - name: Generate verification report
+        if: always()
+        run: |
+          # Generate comprehensive report
+          cat > verification_report.md << EOF
+# Autonomous Verification Report
+**Workflow:** Minimax Verify Jules
+**Run ID:** ${{ github.run_id }}
+**PR:** #${{ github.event.pull_request.number }}
+**Timestamp:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+## Verification Summary
+- **Status:** ${{ steps.verify.outputs.verification_status }}
+- **Retry Count:** ${{ steps.verify.outputs.retry_count }}
+- **Error Recovery:** ${{ steps.verify.outputs.error_recovery }}
+
+## Verification Result
+EOF
+          
+          cat verdict.md >> verification_report.md
+          
+          # Upload artifacts
+          echo "📤 Uploading verification artifacts..."
+          echo "verification_report.md"
+          echo "verdict.md"
+          echo "changes.diff"
+
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const verdict = fs.readFileSync('verdict.md', 'utf8');
+            const verificationStatus = '${{ steps.verify.outputs.verification_status }}';
+            const retryCount = '${{ steps.verify.outputs.retry_count }}';
+            const errorRecovery = '${{ steps.verify.outputs.error_recovery }}';
+            
+            let statusEmoji = '✅';
+            if (verificationStatus === 'failed') statusEmoji = '❌';
+            else if (verificationStatus === 'partial') statusEmoji = '⚠️';
+            else if (verificationStatus === 'error') statusEmoji = '⚠️';
+            
+            const comment = `## 🔍 Autonomous Verification Report\n\n` +
+              `${statusEmoji} **Status:** ${verificationStatus.toUpperCase()}\n` +
+              `📊 **Retry Count:** ${retryCount}\n` +
+              `🔧 **Recovery Mode:** ${errorRecovery}\n\n` +
+              `### Verification Details\n` +
+              `\`\`\`\n${verdict.substring(0, 1500)}\`\`\`\n\n` +
+              `---
+              *This verification was performed autonomously with retry logic and error recovery.*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

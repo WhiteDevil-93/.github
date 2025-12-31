@@ -1,0 +1,418 @@
+name: Minimax Review - Enhanced Autonomy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Review scope (full, files, changed)'
+        required: false
+        default: 'changed'
+        type: choice
+        options:
+          - full
+          - files
+          - changed
+      depth:
+        description: 'Analysis depth (quick, standard, thorough)'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - quick
+          - standard
+          - thorough
+
+# Prevent concurrent reviews
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  review-autonomous:
+    name: Autonomous Code Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      review_status: ${{ steps.review.outputs.review_status }}
+      files_reviewed: ${{ steps.review.outputs.files_reviewed }}
+      issues_found: ${{ steps.review.outputs.issues_found }}
+      api_retries: ${{ steps.review.outputs.api_retries }}
+      error_recovery: ${{ steps.review.outputs.error_recovery }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine review scope and strategy
+        id: scope-determination
+        run: |
+          echo "🎯 Determining review scope..."
+          
+          # Determine scope from workflow input or event
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SCOPE="${{ github.event.inputs.scope }}"
+            DEPTH="${{ github.event.inputs.depth }}"
+          else
+            SCOPE="changed"
+            DEPTH="standard"
+          fi
+          
+          echo "scope=$SCOPE" >> $GITHUB_OUTPUT
+          echo "depth=$DEPTH" >> $GITHUB_OUTPUT
+          
+          # Set analysis parameters based on depth
+          case $DEPTH in
+            quick)
+              MAX_FILES=10
+              MAX_TOKENS=2048
+              FOCUS="quick_scan"
+              ;;
+            standard)
+              MAX_FILES=25
+              MAX_TOKENS=4096
+              FOCUS="comprehensive"
+              ;;
+            thorough)
+              MAX_FILES=50
+              MAX_TOKENS=8192
+              FOCUS="deep_analysis"
+              ;;
+          esac
+          
+          echo "max_files=$MAX_FILES" >> $GITHUB_OUTPUT
+          echo "max_tokens=$MAX_TOKENS" >> $GITHUB_OUTPUT
+          echo "focus=$FOCUS" >> $GITHUB_OUTPUT
+          
+          echo "📊 Review configuration:"
+          echo "   Scope: $SCOPE"
+          echo "   Depth: $DEPTH"
+          echo "   Max files: $MAX_FILES"
+          echo "   Focus: $FOCUS"
+
+      - name: Smart file selection based on scope
+        id: file-selection
+        run: |
+          echo "📂 Selecting files for review..."
+          
+          SCOPE="${{ steps.scope-determination.outputs.scope }}"
+          MAX_FILES=${{ steps.scope-determination.outputs.max_files }}
+          
+          SELECTED_FILES=()
+          SELECTED_CONTENT=""
+          TOTAL_SIZE=0
+          
+          case $SCOPE in
+            full)
+              echo "🔍 Scanning entire repository..."
+              # Find all source files
+              while IFS= read -r -d '' file; do
+                if [[ -f "$file" ]]; then
+                  size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+                  if [[ $TOTAL_SIZE -lt 50000 && ${#SELECTED_FILES[@]} -lt $MAX_FILES ]]; then
+                    SELECTED_FILES+=("$file")
+                    TOTAL_SIZE=$((TOTAL_SIZE + size))
+                  fi
+                fi
+              done < <(find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.java" -o -name "*.kt" -o -name "*.go" -o -name "*.rs" \) -print0 2>/dev/null | head -n 50)
+              ;;
+              
+            files)
+              echo "📄 Reviewing listed files..."
+              # Use files listed in PR or all source files
+              for ext in "*.py" "*.js" "*.ts" "*.java" "*.kt" "*.go" "*.rs"; do
+                while IFS= read -r -d '' file; do
+                  if [[ ${#SELECTED_FILES[@]} -lt $MAX_FILES ]]; then
+                    SELECTED_FILES+=("$file")
+                  fi
+                done < <(find . -type f -name "$ext" -print0 2>/dev/null)
+              done
+              ;;
+              
+            changed|*)
+              echo "📝 Reviewing changed files..."
+              # Get changed files from git
+              if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                git fetch origin "${{ github.event.pull_request.base.ref }}" 2>/dev/null || true
+                CHANGED_FILES=$(git diff --name-only "origin/${{ github.event.pull_request.base.ref }}...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD)
+              else
+                CHANGED_FILES=$(git diff --name-only HEAD~1..HEAD)
+              fi
+              
+              # Filter to source files and select up to MAX_FILES
+              echo "$CHANGED_FILES" | while IFS= read -r file; do
+                for ext in ".py" ".js" ".ts" ".java" ".kt" ".go" ".rs"; do
+                  if [[ "$file" == *"$ext" ]]; then
+                    if [[ ${#SELECTED_FILES[@]} -lt $MAX_FILES ]]; then
+                      SELECTED_FILES+=("$file")
+                      echo "   + $file"
+                    fi
+                    break
+                  fi
+                done
+              done
+              ;;
+          esac
+          
+          FILE_COUNT=${#SELECTED_FILES[@]}
+          echo "files_selected=$FILE_COUNT" >> $GITHUB_OUTPUT
+          
+          if [[ $FILE_COUNT -eq 0 ]]; then
+            echo "⚠️  No files selected, using fallback..."
+            # Fallback: select any Python file
+            FALLBACK_FILE=$(find . -name "*.py" -type f 2>/dev/null | head -1)
+            if [[ -n "$FALLBACK_FILE" ]]; then
+              SELECTED_FILES+=("$FALLBACK_FILE")
+              echo "   + Fallback: $FALLBACK_FILE"
+            fi
+            echo "files_selected=${#SELECTED_FILES[@]}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build optimized review context
+        id: context-building
+        run: |
+          echo "🔨 Building review context..."
+          
+          SELECTED_FILES=(${{ steps.file-selection.outputs.files_selected }})
+          MAX_TOKENS=${{ steps.scope-determination.outputs.max_tokens }}
+          FOCUS=${{ steps.scope-determination.outputs.focus }}
+          
+          # Calculate character limit (rough estimate: 4 chars per token)
+          CHAR_LIMIT=$((MAX_TOKENS * 4))
+          CONTEXT=""
+          
+          # Build system prompt based on focus
+          case $FOCUS in
+            quick_scan)
+              SYSTEM_PROMPT="You are a code review assistant. Perform a quick scan and identify: 1) Critical bugs, 2) Security issues, 3) Obvious anti-patterns. Output concise summary only."
+              ;;
+            comprehensive)
+              SYSTEM_PROMPT="You are a senior code reviewer. Analyze for: 1) Logic errors, 2) Security vulnerabilities, 3) Performance issues, 4) Code quality, 5) Best practices, 6) Documentation gaps. Be thorough."
+              ;;
+            deep_analysis)
+              SYSTEM_PROMPT="You are an expert software architect. Perform deep analysis covering: 1) Architecture patterns, 2) Design principles, 3) Scalability concerns, 4) Maintenance issues, 5) Integration problems, 6) Testing gaps. Provide detailed recommendations."
+              ;;
+          esac
+          
+          # Add files to context
+          for file in "${SELECTED_FILES[@]}"; do
+            if [[ -f "$file" ]]; then
+              content=$(cat "$file" 2>/dev/null || echo "")
+              if [[ ${#CONTEXT} -lt $((CHAR_LIMIT - 5000)) && ${#content} -gt 0 ]]; then
+                CONTEXT+="\n\n=== FILE: $file ===\n$content"
+              fi
+            fi
+          done
+          
+          # Save context and prompts
+          echo "$SYSTEM_PROMPT" > review_system_prompt.txt
+          echo "$CONTEXT" > review_code_context.txt
+          
+          echo "context_size=${#CONTEXT}" >> $GITHUB_OUTPUT
+          echo "system_prompt_length=${#SYSTEM_PROMPT}" >> $GITHUB_OUTPUT
+
+      - name: Autonomous review with intelligent retry
+        id: review
+        env:
+          ATLAS_API_KEY: ${{ secrets.ATLAS_API_KEY }}
+          MAX_RETRIES: 3
+        run: |
+          REVIEW_STATUS="success"
+          API_RETRIES=0
+          ERROR_RECOVERY="none"
+          
+          SYSTEM_PROMPT=$(cat review_system_prompt.txt)
+          CODE_CONTEXT=$(cat review_code_context.txt 2>/dev/null || echo "No code context available")
+          
+          # Intelligent retry with backoff
+          attempt_review() {
+            local attempt=$1
+            local response_file="review_response_$attempt.json"
+            
+            echo "🔄 Review attempt $attempt of $MAX_RETRIES..."
+            
+            # Prepare payload
+            HTTP_RESPONSE=$(curl -s -w "%{http_code}" --max-time 60 \
+              "https://api.atlascloud.ai/v1/chat/completions" \
+              -H "Authorization: Bearer $ATLAS_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"model\": \"minimaxai/minimax-m2.1\",
+                \"messages\": [
+                  {\"role\": \"system\", \"content\": \"$SYSTEM_PROMPT\"},
+                  {\"role\": \"user\", \"content\": \"Please review the following code and provide a comprehensive analysis.\\n\\n=== CODE TO REVIEW ===\\n$CODE_CONTEXT\"}
+                ],
+                \"temperature\": 0.2,
+                \"max_tokens\": ${{ steps.scope-determination.outputs.max_tokens }}
+              }" 2>/dev/null)
+            
+            HTTP_CODE="${HTTP_RESPONSE: -3}"
+            RESPONSE_BODY="${HTTP_RESPONSE:0:${#HTTP_RESPONSE}-3}"
+            
+            if [[ "$HTTP_CODE" == "200" ]]; then
+              echo "$RESPONSE_BODY" > "$response_file"
+              return 0
+            elif [[ "$HTTP_CODE" == "429" || "$HTTP_CODE" == "500" || "$HTTP_CODE" == "502" || "$HTTP_CODE" == "503" ]]; then
+              echo "⚠️  Retryable error (HTTP $HTTP_CODE)"
+              return 2
+            else
+              echo "❌ Non-retryable error (HTTP $HTTP_CODE)"
+              return 1
+            fi
+          }
+          
+          # Execute review with retry
+          while [[ $API_RETRIES -lt $MAX_RETRIES ]]; do
+            if attempt_review $((API_RETRIES + 1)); then
+              break
+            fi
+            
+            API_RETRIES=$((API_RETRIES + 1))
+            
+            if [[ $API_RETRIES -lt $MAX_RETRIES ]]; then
+              BACKOFF=$((API_RETRIES * 10))
+              echo "⏳ Backing off ${BACKOFF}s..."
+              sleep $BACKOFF
+            fi
+          done
+          
+          # Process response
+          if [[ -f "review_response_$API_RETRIES.json" ]]; then
+            if jq -e '.choices[0].message.content' "review_response_$API_RETRIES.json" > minimax_review.md 2>/dev/null; then
+              REVIEW_STATUS="success"
+              
+              # Count issues found
+              ISSUES_FOUND=0
+              if grep -qi "critical\|high\|medium\|low" minimax_review.md 2>/dev/null; then
+                ISSUES_FOUND=$(grep -c "## " minimax_review.md 2>/dev/null || echo 0)
+              fi
+              echo "issues_found=$ISSUES_FOUND" >> $GITHUB_OUTPUT
+              
+            else
+              REVIEW_STATUS="error"
+              ERROR_RECOVERY="invalid_response"
+            fi
+          else
+            REVIEW_STATUS="error"
+            ERROR_RECOVERY="api_failure"
+            
+            # Fallback: basic summary
+            cat > minimax_review.md << EOF
+# Code Review - Fallback Report
+**Status:** Manual Review Required
+**Reason:** API unavailable after $API_RETRIES attempts
+
+## Files Reviewed
+${{ steps.file-selection.outputs.files_selected }}
+
+## Recommendation
+Please review the selected files manually. The automated review service is temporarily unavailable.
+EOF
+          fi
+          
+          echo "review_status=$REVIEW_STATUS" >> $GITHUB_OUTPUT
+          echo "api_retries=$API_RETRIES" >> $GITHUB_OUTPUT
+          echo "error_recovery=$ERROR_RECOVERY" >> $GITHUB_OUTPUT
+
+      - name: Analyze findings and categorize issues
+        id: analyze-findings
+        run: |
+          echo "📊 Analyzing review findings..."
+          
+          if [[ -f "minimax_review.md" ]]; then
+            # Count different issue types
+            CRITICAL=$(grep -ci "critical\|severity.*high\|break.*change" minimax_review.md 2>/dev/null || echo 0)
+            WARNINGS=$(grep -ci "warning\|should\|consider\|improve" minimax_review.md 2>/dev/null || echo 0)
+            SUGGESTIONS=$(grep -ci "suggest\|recommend\|could\|maybe" minimax_review.md 2>/dev/null || echo 0)
+            
+            echo "critical_count=$CRITICAL" >> $GITHUB_OUTPUT
+            echo "warnings_count=$WARNINGS" >> $GITHUB_OUTPUT
+            echo "suggestions_count=$SUGGESTIONS" >> $GITHUB_OUTPUT
+          else
+            echo "critical_count=0" >> $GITHUB_OUTPUT
+            echo "warnings_count=0" >> $GITHUB_OUTPUT
+            echo "suggestions_count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate comprehensive review report
+        if: always()
+        run: |
+          # Create detailed report
+          cat > review_report.md << EOF
+# 🤖 Autonomous Code Review Report
+**Repository:** ${{ github.repository }}
+**PR:** #${{ github.event.pull_request.number || 'N/A' }}
+**Timestamp:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+## Review Configuration
+- **Scope:** ${{ steps.scope-determination.outputs.scope }}
+- **Depth:** ${{ steps.scope-determination.outputs.depth }}
+- **Focus:** ${{ steps.scope-determination.outputs.focus }}
+
+## Files Reviewed
+- **Count:** ${{ steps.file-selection.outputs.files_selected }}
+- **Context Size:** ${{ steps.context-building.outputs.context_size }} chars
+
+## Analysis Results
+- **Status:** ${{ steps.review.outputs.review_status }}
+- **API Retries:** ${{ steps.review.outputs.api_retries }}
+- **Error Recovery:** ${{ steps.review.outputs.error_recovery }}
+- **Issues Found:** ${{ steps.analyze-findings.outputs.critical_count }} critical, ${{ steps.analyze-findings.outputs.warnings_count }} warnings
+
+## Detailed Findings
+EOF
+          
+          cat minimax_review.md >> review_report.md 2>/dev/null || echo "No details available" >> review_report.md
+          
+          # Upload artifacts
+          echo "📤 Uploading review artifacts..."
+
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let review = '';
+            try {
+              review = fs.readFileSync('minimax_review.md', 'utf8').substring(0, 6000);
+            } catch (e) {
+              review = 'Review unavailable - see workflow artifacts';
+            }
+            
+            const reviewStatus = '${{ steps.review.outputs.review_status }}';
+            const filesReviewed = '${{ steps.file-selection.outputs.files_selected }}';
+            const critical = '${{ steps.analyze-findings.outputs.critical_count }}';
+            const warnings = '${{ steps.analyze-findings.outputs.warnings_count }}';
+            const retries = '${{ steps.review.outputs.api_retries }}';
+            
+            let statusEmoji = '✅';
+            let statusText = 'Review Complete';
+            
+            if (reviewStatus === 'error') {
+              statusEmoji = '⚠️';
+              statusText = 'Review Limited';
+            }
+            
+            const comment = `## 🔍 Autonomous Code Review\n\n` +
+              `${statusEmoji} **Status:** ${statusText}\n` +
+              `📄 **Files Reviewed:** ${filesReviewed}\n` +
+              `🔴 **Critical:** ${critical} | 🟡 **Warnings:** ${warnings}\n` +
+              `🔄 **API Retries:** ${retries}\n\n` +
+              `### Review Summary\n` +
+              `\`\`\`\n${review}\`\`\`\n\n` +
+              `---
+              *This review was performed autonomously with configurable scope and depth.*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

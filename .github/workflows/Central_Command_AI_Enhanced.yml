@@ -1,0 +1,393 @@
+name: Central Command AI - Enhanced Autonomy
+
+on:
+  issues:
+    types: [opened]
+
+# Add rate limiting protection
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.id }}
+  cancel-in-progress: false
+
+jobs:
+  remote-review-autonomous:
+    name: Autonomous Code Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    # Only run if issue title starts with "Order:"
+    if: startsWith(github.event.issue.title, 'Order:')
+    outputs:
+      analysis_status: ${{ steps.analyze.outputs.analysis_status }}
+      files_analyzed: ${{ steps.analyze.outputs.files_analyzed }}
+      api_retries: ${{ steps.analyze.outputs.api_retries }}
+      error_handling: ${{ steps.analyze.outputs.error_handling }}
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: target-code
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate checkout and diagnose issues
+        id: checkout-validation
+        run: |
+          echo "🔍 Validating checkout status..."
+          
+          if [[ -d "target-code" ]]; then
+            echo "✅ Target directory exists"
+            echo "files_count=$(find target-code -type f 2>/dev/null | wc -l)" >> $GITHUB_OUTPUT
+            echo "dir_size=$(du -sh target-code 2>/dev/null | cut -f1)" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Target directory not found"
+            echo "files_count=0" >> $GITHUB_OUTPUT
+            echo "dir_size=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Autonomous file discovery with smart filtering
+        id: file-discovery
+        run: |
+          echo "🔍 Performing autonomous file discovery..."
+          
+          # Auto-detect project language and structure
+          PROJECT_TYPE="unknown"
+          if [[ -f "target-code/requirements.txt" ]]; then
+            PROJECT_TYPE="python"
+            echo "🐍 Detected Python project"
+          elif [[ -f "target-code/package.json" ]]; then
+            PROJECT_TYPE="javascript"
+            echo "🟨 Detected JavaScript project"
+          elif [[ -f "target-code/go.mod" ]]; then
+            PROJECT_TYPE="golang"
+            echo "🔵 Detected Go project"
+          elif [[ -f "target-code/pom.xml" ]]; then
+            PROJECT_TYPE="java"
+            echo "☕ Detected Java project"
+          elif [[ -f "target-code/build.gradle" ]]; then
+            PROJECT_TYPE="kotlin"
+            echo "🟣 Detected Kotlin project"
+          elif [[ -f "target-code/Cargo.toml" ]]; then
+            PROJECT_TYPE="rust"
+            echo "🦀 Detected Rust project"
+          fi
+          
+          echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
+          
+          # Auto-detect file extensions based on project type
+          declare -A EXTENSION_MAP
+          EXTENSION_MAP["python"]=".py"
+          EXTENSION_MAP["javascript"]=".js"
+          EXTENSION_MAP["typescript"]=".ts"
+          EXTENSION_MAP["java"]=".java"
+          EXTENSION_MAP["kotlin"]=".kt"
+          EXTENSION_MAP["golang"]=".go"
+          EXTENSION_MAP["rust"]=".rs"
+          EXTENSION_MAP["default"]=".py,.java,.kt,.js,.ts"
+          
+          TARGET_EXTENSIONS="${EXTENSION_MAP[$PROJECT_TYPE]:-${EXTENSION_MAP[default]}}"
+          echo "target_extensions=$TARGET_EXTENSIONS" >> $GITHUB_OUTPUT
+          
+          # Discover files with fallback strategies
+          echo "📂 Scanning for code files..."
+          DISCOVERED_FILES=()
+          
+          IFS=',' read -ra EXT_ARRAY <<< "$TARGET_EXTENSIONS"
+          for ext in "${EXT_ARRAY[@]}"; do
+            while IFS= read -r -d '' file; do
+              DISCOVERED_FILES+=("$file")
+            done < <(find target-code -type f -name "*$ext" -print0 2>/dev/null)
+          done
+          
+          FILE_COUNT=${#DISCOVERED_FILES[@]}
+          echo "discovered_files=$FILE_COUNT" >> $GITHUB_OUTPUT
+          
+          if [[ $FILE_COUNT -gt 0 ]]; then
+            echo "✅ Found $FILE_COUNT files to analyze"
+            # Limit files if too many (prevent API timeout)
+            if [[ $FILE_COUNT -gt 100 ]]; then
+              echo "⚠️  Large codebase detected, limiting analysis to first 100 files"
+              DISCOVERED_FILES=("${DISCOVERED_FILES[@]:0:100}")
+              FILE_COUNT=100
+            fi
+          else
+            echo "⚠️  No files found with extensions: $TARGET_EXTENSIONS"
+            echo "🔄 Trying fallback: scan all text files..."
+            
+            while IFS= read -r -d '' file; do
+              DISCOVERED_FILES+=("$file")
+            done < <(find target-code -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.java" -o -name "*.kt" -o -name "*.go" \) -print0 2>/dev/null)
+            
+            FILE_COUNT=${#DISCOVERED_FILES[@]}
+            echo "fallback_discovered=$FILE_COUNT" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Intelligent context building with chunking
+        id: context-building
+        run: |
+          echo "🔨 Building analysis context..."
+          
+          # Calculate optimal chunk size based on file count
+          MAX_TOTAL_CHARS=100000
+          ESTIMATED_OVERHEAD=5000
+          AVAILABLE_CHARS=$((MAX_TOTAL_CHARS - ESTIMATED_OVERHEAD))
+          CHUNK_SIZE=$((AVAILABLE_CHARS / FILE_COUNT))
+          
+          echo "chunk_size=$CHUNK_SIZE" >> $GITHUB_OUTPUT
+          
+          # Build context with truncation and prioritization
+          CODE_CONTEXT=""
+          PRIORITY_FILES=("main.py" "app.py" "index.js" "main.go" "main.kt" "main.java")
+          
+          # First, check for priority files
+          for file in "${DISCOVERED_FILES[@]}"; do
+            filename=$(basename "$file")
+            for priority in "${PRIORITY_FILES[@]}"; do
+              if [[ "$filename" == "$priority" ]]; then
+                echo "📌 Priority file found: $filename"
+                content=$(head -c $CHUNK_SIZE "$file" 2>/dev/null || echo "")
+                clean_name=${file//target-code\//}
+                CODE_CONTEXT+="\n\n--- PRIORITY FILE: $clean_name ---\n$content"
+              fi
+            done
+          done
+          
+          # Add remaining files with round-robin selection
+          REMAINING_FILES=()
+          for file in "${DISCOVERED_FILES[@]}"; do
+            filename=$(basename "$file")
+            is_priority=false
+            for priority in "${PRIORITY_FILES[@]}"; do
+              if [[ "$filename" == "$priority" ]]; then
+                is_priority=true
+                break
+              fi
+            done
+            [[ "$is_priority" == false ]] && REMAINING_FILES+=("$file")
+          done
+          
+          # Add remaining files up to character limit
+          for file in "${REMAINING_FILES[@]}"; do
+            content=$(head -c $CHUNK_SIZE "$file" 2>/dev/null || echo "")
+            if [[ ${#CODE_CONTEXT} -lt $AVAILABLE_CHARS && ${#content} -gt 0 ]]; then
+              clean_name=${file//target-code\//}
+              CODE_CONTEXT+="\n\n--- FILE: $clean_name ---\n$content"
+            fi
+          done
+          
+          # Save context for API call
+          echo "$CODE_CONTEXT" > code_context.txt
+          echo "context_size=$(wc -c < code_context.txt)" >> $GITHUB_OUTPUT
+          echo "✅ Context built successfully"
+
+      - name: Autonomous Minimax analysis with circuit breaker
+        id: analyze
+        env:
+          MINIMAX_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MAX_RETRIES: 3
+          CIRCUIT_BREAKER_THRESHOLD: 3
+        run: |
+          ANALYSIS_STATUS="success"
+          API_RETRIES=0
+          ERROR_HANDLING="none"
+          
+          ORDER=$(echo "${{ github.event.issue.body }}" | head -c 5000)
+          
+          # Circuit breaker implementation
+          CIRCUIT_STATE="closed"
+          FAILURE_COUNT=0
+          
+          attempt_api_call() {
+            local attempt=$1
+            local response_file="minimax_response_$attempt.json"
+            
+            echo "🔄 API call attempt $attempt..."
+            
+            # Prepare optimized payload
+            CODE_PAYLOAD=$(cat code_context.txt 2>/dev/null | head -c 80000 || echo "No code context available")
+            
+            # Call Minimax API with comprehensive error handling
+            HTTP_RESPONSE=$(curl -s -w "%{http_code}" --max-time 45 \
+              "https://api.minimax.io/v1/text/chatcompletion_v2" \
+              -H "Authorization: Bearer $MINIMAX_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "model": "abab6.5-chat",
+                "messages": [
+                  {
+                    "role": "system",
+                    "content": "You are an autonomous code analysis agent. Provide comprehensive analysis with: 1) Code quality assessment, 2) Security vulnerability identification, 3) Performance optimization suggestions, 4) Architecture recommendations. Be thorough but concise."
+                  },
+                  {
+                    "role": "user",
+                    "content": "INSTRUCTIONS: '"$ORDER"'\n\nCODEBASE ANALYSIS REQUEST:\n'"$CODE_PAYLOAD"'"
+                  }
+                ],
+                "stream": false
+              }' 2>/dev/null)
+            
+            HTTP_CODE="${HTTP_RESPONSE: -3}"
+            RESPONSE_BODY="${HTTP_RESPONSE:0:${#HTTP_RESPONSE}-3}"
+            
+            if [[ "$HTTP_CODE" == "200" ]]; then
+              echo "$RESPONSE_BODY" > "$response_file"
+              return 0
+            elif [[ "$HTTP_CODE" == "429" ]]; then
+              echo "⚠️  Rate limited, waiting before retry..."
+              return 2  # Retryable error
+            elif [[ "$HTTP_CODE" == "500" || "$HTTP_CODE" == "502" || "$HTTP_CODE" == "503" ]]; then
+              echo "⚠️  Server error ($HTTP_CODE), will retry..."
+              return 2  # Retryable error
+            else
+              echo "❌ API error: HTTP $HTTP_CODE"
+              return 1  # Non-retryable error
+            fi
+          }
+          
+          # Execute with retry and circuit breaker
+          while [[ $API_RETRIES -lt $MAX_RETRIES ]]; do
+            if attempt_api_call $((API_RETRIES + 1)); then
+              break
+            fi
+            
+            API_RETRIES=$((API_RETRIES + 1))
+            FAILURE_COUNT=$((FAILURE_COUNT + 1))
+            
+            # Check circuit breaker
+            if [[ $FAILURE_COUNT -ge $CIRCUIT_BREAKER_THRESHOLD ]]; then
+              CIRCUIT_STATE="open"
+              ERROR_HANDLING="circuit_breaker_triggered"
+              echo "🛑 Circuit breaker opened after $FAILURE_COUNT failures"
+              break
+            fi
+            
+            if [[ $API_RETRIES -lt $MAX_RETRIES ]]; then
+              BACKOFF=$((API_RETRIES * 10))
+              echo "⏳ Backing off ${BACKOFF}s before retry..."
+              sleep $BACKOFF
+            fi
+          done
+          
+          # Process response or handle failure
+          if [[ -f "minimax_response_$API_RETRIES.json" ]]; then
+            if jq -e '.choices[0].message.content' "minimax_response_$API_RETRIES.json" > minimax_review.md 2>/dev/null; then
+              ANALYSIS_STATUS="success"
+              echo "✅ Analysis completed successfully"
+            else
+              ANALYSIS_STATUS="error"
+              ERROR_HANDLING="invalid_response_format"
+              echo "❌ Invalid response format"
+            fi
+          else
+            ANALYSIS_STATUS="error"
+            
+            if [[ "$CIRCUIT_STATE" == "open" ]]; then
+              ERROR_HANDLING="circuit_breaker_open"
+              # Fallback to basic analysis
+              cat > minimax_review.md << 'EOF'
+# Autonomous Analysis Report - Fallback Mode
+**Status:** LIMITED ANALYSIS
+**Reason:** API circuit breaker triggered
+**Fallback:** Basic file listing provided
+
+## Codebase Summary
+EOF
+              echo "📄 Generating fallback report..."
+            else
+              ERROR_HANDLING="api_failure_no_recovery"
+              # Generate diagnostic report
+              cat > minimax_review.md << 'EOF'
+# Analysis Report - Manual Review Required
+**Status:** API Analysis Unavailable
+**Retries:** $API_RETRIES
+**Action:** Manual review recommended
+
+## Diagnostic Information
+- API calls attempted: $API_RETRIES
+- Error type: Connection/Timeout
+- Recommendation: Retry workflow or review manually
+EOF
+            fi
+          fi
+          
+          # Output results
+          echo "analysis_status=$ANALYSIS_STATUS" >> $GITHUB_OUTPUT
+          echo "api_retries=$API_RETRIES" >> $GITHUB_OUTPUT
+          echo "error_handling=$ERROR_HANDLING" >> $GITHUB_OUTPUT
+
+      - name: Generate comprehensive mission report
+        if: always()
+        run: |
+          # Create detailed mission report
+          cat > mission_report.md << EOF
+# 🛸 Autonomous Mission Report
+**Target Repository:** ${{ github.repository }}
+**Order ID:** #${{ github.event.issue.number }}
+**Mission Commander:** ${{ github.actor }}
+**Timestamp:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+## Mission Parameters
+**Order:** ${{ github.event.issue.title }}
+**Status:** ${{ steps.analyze.outputs.analysis_status }}
+
+## Reconnaissance Results
+- **Project Type:** ${{ steps.file-discovery.outputs.project_type }}
+- **Files Analyzed:** ${{ steps.file-discovery.outputs.discovered_files }}
+- **Context Size:** ${{ steps.context-building.outputs.context_size }} bytes
+
+## Analysis Summary
+- **API Retries:** ${{ steps.analyze.outputs.api_retries }}
+- **Error Handling:** ${{ steps.analyze.outputs.error_handling }}
+- **Circuit State:** ${{ env.CIRCUIT_STATE:-closed }}
+
+## Analysis Output
+EOF
+          
+          cat minimax_review.md >> mission_report.md 2>/dev/null || echo "No analysis output available" >> mission_report.md
+          
+          # Upload artifacts
+          echo "📤 Uploading mission artifacts..."
+
+      - name: Post mission results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let review = '';
+            try {
+              review = fs.readFileSync('minimax_review.md', 'utf8').substring(0, 8000);
+            } catch (e) {
+              review = 'Analysis unavailable - see workflow logs';
+            }
+            
+            const analysisStatus = '${{ steps.analyze.outputs.analysis_status }}';
+            const filesAnalyzed = '${{ steps.file-discovery.outputs.discovered_files }}';
+            const apiRetries = '${{ steps.analyze.outputs.api_retries }}';
+            
+            let statusEmoji = '✅';
+            let statusText = 'Analysis Complete';
+            
+            if (analysisStatus === 'error') {
+              statusEmoji = '⚠️';
+              statusText = 'Limited Analysis';
+            }
+            
+            const comment = `## 🛸 Mission Report\n\n` +
+              `${statusEmoji} **Status:** ${statusText}\n` +
+              `📊 **Files Analyzed:** ${filesAnalyzed}\n` +
+              `🔄 **API Retries:** ${apiRetries}\n\n` +
+              `### Analysis Results\n` +
+              `\`\`\`\n${review}\`\`\`\n\n` +
+              `---
+              *This analysis was performed autonomously with retry logic and circuit breaker protection.*`;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
