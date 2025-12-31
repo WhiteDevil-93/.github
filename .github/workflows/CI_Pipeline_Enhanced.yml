@@ -32,17 +32,44 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Debug environment info
+        run: |
+          echo "🔍 Debug Info:"
+          echo "Python version env: $PYTHON_VERSION"
+          echo "Node version env: $NODE_VERSION"
+          echo "Runner OS: ${{ runner.os }}"
+          echo "Workspace: ${{ github.workspace }}"
+          echo "✅ Environment check complete"
+
       - name: Setup Python with caching
+        id: python-setup
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/setup.py
+            **/pyproject.toml
+
+      - name: Verify Python installation
+        run: |
+          echo "✅ Python setup successful"
+          python --version
+          pip --version
 
       - name: Setup Node.js with caching
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: '20'
           cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Verify Node installation
+        run: |
+          echo "✅ Node.js setup successful"
+          node --version
+          npm --version
 
       - name: Install dependencies with fallback
         id: deps-install
@@ -52,13 +79,13 @@ jobs:
           
           # Python dependencies with recovery
           echo "🐍 Installing Python tools..."
-          if ! python -m pip install --upgrade pip 2>/dev/null; then
-            echo "⚠️  pip upgrade failed, continuing..."
-          fi
+          python -m pip install --upgrade pip || echo "⚠️  pip upgrade failed, continuing..."
           
           for tool in ruff mypy black; do
-            if ! pip install $tool 2>/dev/null; then
-              echo "⚠️  Failed to install $tool"
+            if pip install $tool 2>&1; then
+              echo "✅ Installed: $tool"
+            else
+              echo "⚠️  Failed to install: $tool"
               INSTALL_FAILED+=("$tool")
             fi
           done
@@ -66,10 +93,11 @@ jobs:
           # Node dependencies with recovery
           echo "🟨 Installing Node tools..."
           for tool in eslint prettier; do
-            if ! npm install -g $tool 2>/dev/null; then
-              echo "⚠️  Failed to install $tool globally"
-              # Try local install as fallback
-              npm install --save-dev $tool 2>/dev/null || INSTALL_FAILED+=("$tool")
+            if npm install -g $tool 2>&1; then
+              echo "✅ Installed: $tool"
+            else
+              echo "⚠️  Failed to install $tool globally, trying local..."
+              npm install --save-dev $tool 2>&1 || INSTALL_FAILED+=("$tool")
             fi
           done
           
@@ -91,20 +119,20 @@ jobs:
           
           # Ruff linter with recovery
           echo "📋 Running Ruff..."
-          if ruff check . 2>/dev/null; then
+          if ruff check . 2>&1; then
             echo "✅ Ruff: PASSED"
           else
             echo "⚠️  Ruff found issues (may be style only)"
             TOOL_RESULTS+=("ruff:issues")
           fi
           
-          # Black formatter with auto-fix attempt
+          # Black formatter check with auto-fix
           echo "🎨 Checking Black format..."
-          if black --check . 2>/dev/null; then
+          if black --check . 2>&1; then
             echo "✅ Black: PASSED"
           else
             echo "🔄 Attempting auto-fix..."
-            if black . 2>/dev/null; then
+            if black . 2>&1; then
               echo "✅ Black: AUTO-FIXED"
               ERRORS_RECOVERED=$((ERRORS_RECOVERED + 1))
             else
@@ -115,7 +143,7 @@ jobs:
           
           # MyPy type checking
           echo "🔤 Running MyPy..."
-          if mypy themyscira/ --ignore-missing-imports 2>/dev/null; then
+          if mypy themyscira/ --ignore-missing-imports 2>&1; then
             echo "✅ MyPy: PASSED"
           else
             echo "⚠️  MyPy: Type hints incomplete (non-critical)"
@@ -124,20 +152,20 @@ jobs:
           
           # ESLint
           echo "🟨 Running ESLint..."
-          if eslint . 2>/dev/null; then
+          if eslint . 2>&1; then
             echo "✅ ESLint: PASSED"
           else
             echo "⚠️  ESLint: Issues found (non-critical)"
             TOOL_RESULTS+=("eslint:issues")
           fi
           
-          # Prettier
+          # Prettier check with auto-fix
           echo "✨ Checking Prettier..."
-          if prettier --check . 2>/dev/null; then
+          if prettier --check . 2>&1; then
             echo "✅ Prettier: PASSED"
           else
             echo "🔄 Attempting auto-fix..."
-            if prettier --write . 2>/dev/null; then
+            if prettier --write . 2>&1; then
               echo "✅ Prettier: AUTO-FIXED"
               ERRORS_RECOVERED=$((ERRORS_RECOVERED + 1))
             else
@@ -195,21 +223,31 @@ jobs:
       - name: Setup Python with caching
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/setup.py
+            **/pyproject.toml
+
+      - name: Verify Python setup
+        run: |
+          echo "✅ Python setup verified"
+          python --version
 
       - name: Setup Node.js with caching
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: '20'
           cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
 
-      - name: Install dependencies
+      - name: Install test dependencies
         run: |
           echo "📦 Installing test dependencies..."
-          pip install -e . 2>/dev/null || echo "⚠️  Package install failed, trying without -e"
-          pip install pytest pytest-cov pytest-asyncio httpx 2>/dev/null || echo "⚠️  Some test deps missing"
-          npm install 2>/dev/null || echo "⚠️  npm install failed"
+          pip install -e . 2>&1 || echo "⚠️  Package install failed, trying without -e"
+          pip install pytest pytest-cov pytest-asyncio httpx 2>&1 || echo "⚠️  Some test deps missing"
+          npm install 2>&1 || echo "⚠️  npm install failed"
 
       - name: Execute tests with retry
         id: test-execution
@@ -297,12 +335,12 @@ jobs:
       - name: Setup Python with caching
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install security tools
         run: |
-          pip install bandit safety 2>/dev/null || echo "⚠️  Security tools install failed"
+          pip install bandit safety 2>&1 || echo "⚠️  Security tools install failed"
 
       - name: Run security scans with prioritization
         id: security-scan
@@ -314,27 +352,13 @@ jobs:
           
           # Bandit scan
           echo "📊 Running Bandit..."
-          if bandit -r themyscira/ -f json -o bandit_report.json 2>/dev/null; then
+          if bandit -r themyscira/ -f json -o bandit_report.json 2>&1; then
             if [[ -s bandit_report.json ]]; then
               VULNS=$(cat bandit_report.json | jq '.results | length' 2>/dev/null || echo "0")
               VULNERABILITIES_FOUND=$VULNS
               
               if [[ $VULNS -gt 0 ]]; then
-                # Auto-filter known false positives
-                KNOWN_FALSE_POSITIVES=("assert" "hardcoded_password" "dummy_credential" "test_secret" "debug_key")
-                for fp in "${KNOWN_FALSE_POSITIVES[@]}"; do
-                  FILTERED=$(cat bandit_report.json | jq "[.results[] | select(.test_name | contains(\"$fp\") | not)]" 2>/dev/null)
-                  if [[ -n "$FILTERED" ]]; then
-                    echo "$FILTERED" > bandit_report.json
-                    FALSE_POSITIVES=$((FALSE_POSITIVES + 1))
-                  fi
-                done
-                
-                if [[ $VULNS -gt 5 ]]; then
-                  SCAN_STATUS="needs_review"
-                else
-                  SCAN_STATUS="passed_with_notes"
-                fi
+                SCAN_STATUS="needs_review"
               fi
             fi
           else
@@ -343,7 +367,7 @@ jobs:
           
           # Safety check
           echo "🛡️  Running Safety check..."
-          if safety check -r requirements.txt 2>/dev/null | tee safety_report.txt; then
+          if safety check -r requirements.txt 2>&1 | tee safety_report.txt; then
             echo "✅ Safety: No vulnerabilities"
           else
             if grep -q "0 vulnerabilities" safety_report.txt 2>/dev/null; then
@@ -383,7 +407,7 @@ jobs:
       - name: Setup Python with caching
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Setup Docker
@@ -402,7 +426,6 @@ jobs:
             echo "✅ Docker build successful"
           else
             echo "🔄 Attempting build recovery..."
-            # Try with no cache
             if docker build --no-cache -t themyscira:test . 2>&1 | tee docker_build.log; then
               echo "✅ Build recovered with no-cache"
               RECOVERY_ATTEMPTS=$((RECOVERY_ATTEMPTS + 1))
@@ -415,13 +438,12 @@ jobs:
           # Run integration tests
           if [[ "$INTEGRATION_STATUS" != "build_failed" ]]; then
             echo "🧪 Running integration tests..."
-            pip install pytest pytest-asyncio 2>/dev/null || true
+            pip install pytest pytest-asyncio 2>&1 || true
             
             if pytest tests/integration/ -v 2>&1 | tee integration_tests.log; then
               echo "✅ Integration tests passed"
             else
               echo "⚠️  Some integration tests failed"
-              # Check for known flaky tests
               if grep -q "flaky\|timeout\|network" integration_tests.log 2>/dev/null; then
                 echo "🔄 Potential flaky test, retrying..."
                 sleep 3
