@@ -35,12 +35,19 @@ on:
           - 'false'
 
 env:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   MAX_RETRIES: 3
   HEALTH_CHECK_TIMEOUT: 120
 
 jobs:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
   build-autonomous:
     name: Autonomous Docker Build
     runs-on: ubuntu-latest
@@ -78,6 +85,10 @@ jobs:
       - name: Build with retry and caching
         id: build
         env:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
           BUILD_ATTEMPTS: 0
           ERROR_RECOVERY: "none"
         run: |

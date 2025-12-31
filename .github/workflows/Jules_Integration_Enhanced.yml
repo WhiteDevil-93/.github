@@ -41,6 +41,7 @@ jobs:
   trigger-jules-autonomous:
     name: Autonomous Jules Trigger
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
@@ -180,6 +181,7 @@ EOF
   jules-validation-autonomous:
     name: Autonomous Jules Validation
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: trigger-jules-autonomous
     outputs:
       validation_status: ${{ steps.validate.outputs.validation_status }}
@@ -333,6 +335,7 @@ EOF
   publish-results-autonomous:
     name: Publish Jules Results
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: jules-validation-autonomous
     if: github.event_name == 'pull_request'
     steps:
