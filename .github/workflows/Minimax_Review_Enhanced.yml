@@ -33,6 +33,7 @@ jobs:
   review-autonomous:
     name: Autonomous Code Review
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write

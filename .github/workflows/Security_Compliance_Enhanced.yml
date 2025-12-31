@@ -38,6 +38,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
   SEVERITY_THRESHOLD: ${{ github.event.inputs.severity || 'medium' }}
   MAX_RETRIES: 2
 
@@ -45,6 +49,7 @@ jobs:
   dependency-audit-autonomous:
     name: Autonomous Dependency Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       audit_status: ${{ steps.audit.outputs.audit_status }}
       vulnerabilities_found: ${{ steps.audit.outputs.vulnerabilities_found }}
@@ -145,6 +150,7 @@ jobs:
   secrets-detection-autonomous:
     name: Autonomous Secrets Detection
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       secrets_status: ${{ steps.secrets.outputs.secrets_status }}
       secrets_found: ${{ steps.secrets.outputs.secrets_found }}
@@ -257,6 +263,7 @@ EOF
   license-check-autonomous:
     name: Autonomous License Compliance
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       license_status: ${{ steps.license.outputs.license_status }}
       issues_found: ${{ steps.license.outputs.issues_found }}
@@ -332,6 +339,7 @@ EOF
   compliance-report-autonomous:
     name: Autonomous Compliance Report
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [dependency-audit-autonomous, secrets-detection-autonomous, license-check-autonomous]
     if: always()
     outputs:

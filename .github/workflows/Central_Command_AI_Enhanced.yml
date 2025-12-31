@@ -13,6 +13,7 @@ jobs:
   remote-review-autonomous:
     name: Autonomous Code Analysis
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: write

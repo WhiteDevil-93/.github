@@ -12,6 +12,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
   PYTHON_VERSION: '3.11'
   NODE_VERSION: '20'
   MAX_RETRIES: 2
@@ -21,6 +25,7 @@ jobs:
   code-quality-autonomous:
     name: Autonomous Code Quality
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       overall_status: ${{ steps.quality-gate.outputs.overall_status }}
       errors_recovered: ${{ steps.quality-gate.outputs.errors_recovered }}
@@ -210,6 +215,7 @@ jobs:
   test-suite-autonomous:
     name: Autonomous Test Suite
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: code-quality-autonomous
     outputs:
       test_status: ${{ steps.test-execution.outputs.test_status }}
@@ -252,6 +258,10 @@ jobs:
       - name: Execute tests with retry
         id: test-execution
         env:
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
           MAX_RETRIES: 2
         run: |
           echo "🧪 Running test suite..."
@@ -323,6 +333,7 @@ jobs:
   security-scan-autonomous:
     name: Autonomous Security Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: code-quality-autonomous
     outputs:
       scan_status: ${{ steps.security-scan.outputs.scan_status }}
@@ -394,6 +405,7 @@ jobs:
   integration-tests-autonomous:
     name: Autonomous Integration Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [test-suite-autonomous, security-scan-autonomous]
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     outputs:
@@ -467,6 +479,7 @@ jobs:
   quality-gate-autonomous:
     name: Autonomous Quality Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: integration-tests-autonomous
     if: always()
     steps:
